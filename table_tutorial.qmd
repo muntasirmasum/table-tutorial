@@ -1,0 +1,862 @@
+---
+title: "Publication-Ready Tables in R"
+subtitle: "A Practical Guide Using gtsummary and flextable"
+author: "Muntasir Masum, PhD"
+date: last-modified
+date-format: "MMMM D, YYYY"
+
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-depth: 3
+    toc-float: true
+    toc-title: "Contents"
+    code-fold: show
+    code-tools: true
+    number-sections: true
+    smooth-scroll: true
+    embed-resources: true
+    fig-align: center
+    df-print: paged
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+
+knitr:
+  opts_chunk:
+    comment: "#>"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# ── Packages ──────────────────────────────────────────────────────────────────
+library(tidyverse)
+library(labelled)
+library(survey)
+library(gtsummary)
+library(gt)
+library(flextable)
+
+# ── Global gtsummary theme ────────────────────────────────────────────────────
+options(gtsummary.use_ftExtra = TRUE)
+set_gtsummary_theme(theme_gtsummary_compact(set_theme = TRUE))
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+nhis <- readRDS("data/nhis_sample.rds")
+
+# ── Survey design (full sample for descriptive tables) ───────────────────────
+options(survey.lonely.psu = "adjust")
+
+des <- svydesign(
+  id      = ~psu,
+  strata  = ~strata,
+  weights = ~wgt,
+  data    = nhis,
+  nest    = TRUE
+)
+
+# ── Complete-case subset for regression ──────────────────────────────────────
+nhis_cc <- nhis |>
+  drop_na(poor_health, us_born, genx_mil, male, race_eth15,
+          edu4, famincome, marital_stat2, smoker, alcohol,
+          obese, hyperten, region2)
+
+des_cc <- svydesign(
+  id      = ~psu,
+  strata  = ~strata,
+  weights = ~wgt,
+  data    = nhis_cc,
+  nest    = TRUE
+)
+```
+
+# Overview {.unnumbered}
+
+Producing clean, publication-ready tables is one of the most important — and
+most under-taught — skills in applied social science and public health
+research. This tutorial walks through a complete workflow using two
+complementary R packages:
+
+| Package | Strength | Best for |
+|---------|----------|----------|
+| **gtsummary** | Automatic table building with survey support | Table 1, regression tables |
+| **flextable** | Fine-grained formatting control | Word / .docx export |
+
+All examples use a 20,000-observation random sample of the
+[National Health Interview Survey (NHIS)](https://nhis.ipums.org/), linked to
+the National Death Index through the NHIS Linked Mortality Files (LMF). The
+analysis illustrates a common demography and public health workflow: describing
+a sample, then modeling a binary health outcome with survey-weighted logistic
+regression.
+
+::: {.callout-tip}
+## What you will learn
+
+- How to build a complete Table 1 (descriptive statistics), with and without
+  survey weights
+- How to control variable type summaries (continuous vs. categorical)
+- How to produce and format regression tables from `svyglm()` output
+- Advanced gtsummary techniques: removing reference rows, significance stars,
+  managing footnotes, `tbl_merge()`, and `tbl_stack()`
+- How to export polished tables to Word via flextable
+:::
+
+# Data and Variables
+
+The analytic sample contains `r nrow(nhis)` respondents drawn from NHIS waves
+collected between 1997 and 2018, with variables spanning demographics,
+socioeconomic status, health behaviors, and health outcomes.
+
+```{r}
+#| label: tbl-data-dictionary
+#| echo: false
+#| tbl-cap: "Variables in the Teaching Dataset"
+
+tibble::tribble(
+  ~Variable,        ~Label,
+  "us_born",        "U.S.-born vs. Foreign-born",
+  "genx_mil",       "Birth cohort (Generation X / Millennial)",
+  "age_cat",        "Age group",
+  "male",           "Sex",
+  "race_eth15",     "Race/ethnicity (6 categories)",
+  "edu4",           "Educational attainment (4 levels)",
+  "famincome",      "Family income category",
+  "marital_stat2",  "Marital status",
+  "region2",        "U.S. Census region",
+  "smoker",         "Current smoker",
+  "alcohol",        "Heavy alcohol use",
+  "obese",          "Obesity status",
+  "hyperten",       "Hypertension diagnosis",
+  "healthstatus",   "Self-rated health (Healthy / Poor)",
+  "poor_health",    "Poor self-rated health (0 = Healthy, 1 = Poor)",
+  "wgt",            "Mortality analysis weight (mortwtsa)",
+  "strata",         "Survey stratum",
+  "psu",            "Primary sampling unit"
+) |>
+  gt() |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(table.font.size = px(13))
+```
+
+## Survey design {.unnumbered}
+
+NHIS uses a complex multistage probability sample. Correct inference requires
+declaring the survey design before any analysis:
+
+```{r}
+#| label: survey-design-demo
+#| eval: false
+
+library(survey)
+options(survey.lonely.psu = "adjust")
+
+des <- svydesign(
+  id      = ~psu,       # primary sampling unit
+  strata  = ~strata,    # stratification variable
+  weights = ~wgt,       # mortality analysis weight (mortwtsa)
+  data    = nhis,
+  nest    = TRUE        # PSUs nested within strata
+)
+```
+
+::: {.callout-important}
+Always use `nest = TRUE` when PSU IDs are not unique across strata (which is
+the case with NHIS). Setting `options(survey.lonely.psu = "adjust")` prevents
+errors in strata with only one PSU.
+:::
+
+## Global gtsummary options {.unnumbered}
+
+Two global options should be set once per session, before any table is built.
+They apply automatically to every subsequent `tbl_summary()`,
+`tbl_svysummary()`, and `tbl_regression()` call.
+
+```{r}
+#| label: gtsummary-options
+#| eval: false
+
+options(gtsummary.use_ftExtra = TRUE)
+set_gtsummary_theme(theme_gtsummary_compact(set_theme = TRUE))
+```
+
+::: {.callout-tip}
+## Why these two options matter
+
+**`options(gtsummary.use_ftExtra = TRUE)`**
+
+Activates the **ftExtra** backend for flextable rendering. By default,
+gtsummary uses a basic text renderer when converting tables to flextable via
+`as_flex_table()`. With ftExtra enabled, markdown in cell content (bold labels,
+italic levels, superscripts, footnote symbols) is preserved faithfully in the
+Word export. Without it, formatted text can appear as raw markdown syntax in
+the `.docx` file.
+
+**`set_gtsummary_theme(theme_gtsummary_compact(set_theme = TRUE))`**
+
+Applies the **compact theme** globally. Compared to the default theme, compact
+reduces row padding and font size, producing tables that fit comfortably on a
+journal page. Using `set_gtsummary_theme()` as the outer wrapper is the
+recommended pattern in gtsummary 2.x: it registers the theme with the package
+engine so it persists across all tables in the session. Passing
+`set_theme = TRUE` inside `theme_gtsummary_compact()` ensures the theme is
+active immediately even if called in isolation.
+
+Both lines are already active in this tutorial's hidden setup chunk.
+:::
+
+# Part 1: Descriptive Tables (Table 1)
+
+Table 1 in a manuscript reports sample characteristics. The tabs below
+progress from the simplest approach to a fully stratified, weighted table
+ready for publication.
+
+::: {.panel-tabset}
+
+## Unweighted
+
+`tbl_summary()` works directly on a data frame — no survey design needed.
+Appropriate for convenience samples, or as a first pass before adding weights.
+
+```{r}
+#| label: tbl1-unweighted
+
+nhis |>
+  select(us_born, genx_mil, age_cat, male, race_eth15,
+         edu4, famincome, healthstatus) |>
+  tbl_summary(
+    label = list(
+      us_born      ~ "Nativity",
+      genx_mil     ~ "Birth cohort",
+      age_cat      ~ "Age group",
+      male         ~ "Sex",
+      race_eth15   ~ "Race/ethnicity",
+      edu4         ~ "Education",
+      famincome    ~ "Family income",
+      healthstatus ~ "Self-rated health"
+    ),
+    missing = "no"
+  ) |>
+  bold_labels() |>
+  modify_caption("**Table 1. Sample Characteristics (Unweighted)**") |>
+  as_gt()
+```
+
+## Survey-Weighted
+
+`tbl_svysummary()` accepts the `svydesign` object and weights all statistics
+automatically. Proportions and means can differ substantially from the
+unweighted version when survey weights correct for unequal selection
+probabilities.
+
+```{r}
+#| label: tbl1-weighted
+
+des |>
+  tbl_svysummary(
+    include = c(us_born, genx_mil, age_cat, male, race_eth15,
+                edu4, famincome, healthstatus),
+    label = list(
+      us_born      ~ "Nativity",
+      genx_mil     ~ "Birth cohort",
+      age_cat      ~ "Age group",
+      male         ~ "Sex",
+      race_eth15   ~ "Race/ethnicity",
+      edu4         ~ "Education",
+      famincome    ~ "Family income",
+      healthstatus ~ "Self-rated health"
+    ),
+    missing = "no"
+  ) |>
+  bold_labels() |>
+  modify_caption("**Table 1. Sample Characteristics (Survey-Weighted)**") |>
+  as_gt()
+```
+
+## Stratified by Nativity
+
+Add `by =` to compare groups side by side. Chain `add_overall()` for a
+total column, and `add_p()` for group-comparison p-values. Use
+`modify_header()` with `{n}` (unweighted count) to show interpretable
+sample sizes in column headers.
+
+```{r}
+#| label: tbl1-stratified
+
+tbl1 <- des |>
+  tbl_svysummary(
+    by = us_born,
+    include = c(genx_mil, age_cat, male, race_eth15,
+                edu4, famincome, smoker, alcohol, obese,
+                hyperten, healthstatus),
+    label = list(
+      genx_mil     ~ "Birth cohort",
+      age_cat      ~ "Age group",
+      male         ~ "Sex",
+      race_eth15   ~ "Race/ethnicity",
+      edu4         ~ "Education",
+      famincome    ~ "Family income",
+      smoker       ~ "Current smoker",
+      alcohol      ~ "Heavy alcohol use",
+      obese        ~ "Obese",
+      hyperten     ~ "Hypertension",
+      healthstatus ~ "Self-rated health"
+    ),
+    missing = "no"
+  ) |>
+  add_overall(last = FALSE) |>
+  add_p(test.args = all_tests("svy.wilcox.test") ~ list(design = des)) |>
+  bold_labels() |>
+  italicize_levels() |>
+  bold_p(t = 0.05) |>
+  modify_header(
+    stat_0 ~ "**Overall**\nn = {n_unweighted}",
+    stat_1 ~ "**U.S.-Born**\nn = {n_unweighted}",
+    stat_2 ~ "**Foreign-Born**\nn = {n_unweighted}"
+  ) |>
+  modify_caption("**Table 1. Sample Characteristics by Nativity**")
+
+tbl1 |> as_gt()
+```
+
+::: {.callout-tip}
+## Header placeholder guide for `tbl_svysummary`
+
+| Placeholder | Returns | Use when |
+|-------------|---------|----------|
+| `{n_unweighted}` | Unweighted count per group | Column headers (most readable) |
+| `{N_unweighted}` | Total unweighted N | Overall column header |
+| `{n}` | Sum of weights per group | Reporting weighted N |
+| `{N}` | Total sum of weights | Rarely useful in headers |
+
+Both `{n}` and `{N}` return decimals in weighted surveys — use
+`{n_unweighted}` for clean integer counts in column headers.
+:::
+
+:::
+
+## Controlling Variable Type Summaries
+
+By default, gtsummary guesses whether each variable is categorical or
+continuous. You can override this with the `type =` argument, and customize
+the displayed statistics with `statistic =`.
+
+::: {.panel-tabset}
+
+### Default behavior
+
+```{r}
+#| label: tbl-type-default
+
+nhis |>
+  select(age_cat, edu4, poor_health) |>
+  tbl_summary(missing = "no") |>
+  bold_labels() |>
+  as_gt()
+```
+
+### Override: force continuous
+
+Use `type = list(var ~ "continuous")` to display mean ± SD instead of
+counts. Useful for variables that happen to be stored as factors but have
+a meaningful numeric interpretation (e.g., an age index).
+
+```{r}
+#| label: tbl-type-continuous
+
+nhis |>
+  select(age_cat, edu4, poor_health) |>
+  tbl_summary(
+    type    = list(poor_health ~ "continuous"),
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "no"
+  ) |>
+  bold_labels() |>
+  as_gt()
+```
+
+### Override: force categorical
+
+Use `type = list(var ~ "categorical")` to show counts and percentages for a
+numeric variable (e.g., an integer 0/1 outcome where you want both values
+displayed explicitly).
+
+```{r}
+#| label: tbl-type-categorical
+
+nhis |>
+  select(age_cat, edu4, poor_health) |>
+  tbl_summary(
+    type    = list(poor_health ~ "categorical"),
+    missing = "no"
+  ) |>
+  bold_labels() |>
+  as_gt()
+```
+
+:::
+
+::: {.callout-tip}
+## Key gtsummary verbs for Table 1
+
+| Function | Purpose |
+|----------|---------|
+| `tbl_svysummary(by = ...)` | Stratify columns by a grouping variable |
+| `add_overall()` | Append an overall (unstratified) column |
+| `add_p()` | Add p-values for group comparisons |
+| `type = list(var ~ "continuous")` | Force a variable to display mean/SD |
+| `type = list(var ~ "categorical")` | Force a variable to display counts/% |
+| `statistic = list(...)` | Customize the displayed summary statistic |
+| `bold_labels()` | Bold the variable name rows |
+| `italicize_levels()` | Italicize the category rows |
+| `bold_p(t = 0.05)` | Bold significant p-values |
+| `modify_header()` | Rewrite any column header (use `{n}` for counts) |
+| `modify_caption()` | Add or change table caption |
+:::
+
+# Part 2: Regression Tables
+
+We model **poor self-rated health** (binary: 1 = Poor, 0 = Healthy) using
+survey-weighted logistic regression via `svyglm()` with a `quasibinomial()`
+family.
+
+```{r}
+#| label: fit-models
+
+# Model A: Demographic only
+m_A <- svyglm(
+  poor_health ~ us_born + genx_mil + male + race_eth15,
+  design = des_cc,
+  family  = quasibinomial()
+)
+
+# Model B: + Socioeconomic status
+m_B <- svyglm(
+  poor_health ~ us_born + genx_mil + male + race_eth15 +
+                edu4 + famincome,
+  design = des_cc,
+  family  = quasibinomial()
+)
+
+# Model C: Full model
+m_C <- svyglm(
+  poor_health ~ us_born + genx_mil + male + race_eth15 +
+                edu4 + famincome + marital_stat2 +
+                smoker + alcohol + obese + hyperten + region2,
+  design = des_cc,
+  family  = quasibinomial()
+)
+```
+
+The four tabs below demonstrate progressively more refined formatting,
+starting from the default output and building toward a publication-ready table.
+
+::: {.panel-tabset}
+
+## Basic Table
+
+`tbl_regression()` converts any model object into a formatted table.
+Set `exponentiate = TRUE` to display odds ratios instead of log-odds.
+
+```{r}
+#| label: tbl-regression-basic
+
+tbl_regression(m_A, exponentiate = TRUE) |>
+  bold_labels() |>
+  as_gt()
+```
+
+## Remove Reference Rows
+
+By default, gtsummary shows a reference row for each categorical predictor.
+These rows add visual clutter. A single call to
+`remove_row_type(type = "reference")` cleans them up.
+
+::: {.panel-tabset}
+
+### Before
+
+```{r}
+#| label: tbl-ref-before
+
+tbl_regression(m_A, exponentiate = TRUE) |>
+  bold_labels() |>
+  italicize_levels() |>
+  as_gt()
+```
+
+### After
+
+```{r}
+#| label: tbl-ref-after
+
+tbl_regression(m_A, exponentiate = TRUE) |>
+  remove_row_type(type = "reference") |>
+  bold_labels() |>
+  italicize_levels() |>
+  as_gt()
+```
+
+:::
+
+## Significance Stars
+
+Some journals prefer the European style: coefficient (SE) with significance
+stars rather than a confidence interval column.
+Use `add_significance_stars()` with `conf.int = FALSE`.
+
+```{r}
+#| label: tbl-stars
+
+tbl_regression(
+  m_A,
+  exponentiate = TRUE,
+  conf.int     = FALSE
+) |>
+  add_significance_stars(
+    hide_ci  = TRUE,
+    hide_se  = FALSE,
+    pattern  = "{estimate}{stars}"
+  ) |>
+  remove_row_type(type = "reference") |>
+  bold_labels() |>
+  italicize_levels() |>
+  modify_header(estimate ~ "**OR**", std.error ~ "**SE**") |>
+  modify_caption("**Table 2. Model A: Demographic Predictors of Poor Health**") |>
+  as_gt()
+```
+
+::: {.callout-note}
+`pattern = "{estimate}{stars}"` places the stars immediately after the
+estimate. Use `"{estimate} {stars}"` to add a space. `hide_ci = TRUE` drops
+the CI columns entirely.
+:::
+
+## Footnote Management
+
+When you drop the CI columns, the default footnote defining "CI" becomes
+orphaned. Remove it by filtering the internal `table_styling$abbreviation`
+tibble directly.
+
+```{r}
+#| label: tbl-footnote
+
+tbl_no_ci <- tbl_regression(
+  m_B,
+  exponentiate = TRUE,
+  conf.int     = FALSE
+) |>
+  add_significance_stars(
+    hide_ci  = TRUE,
+    hide_se  = FALSE,
+    pattern  = "{estimate}{stars}"
+  ) |>
+  remove_row_type(type = "reference") |>
+  bold_labels() |>
+  italicize_levels() |>
+  modify_header(estimate ~ "**OR**", std.error ~ "**SE**")
+
+# Surgically remove the orphaned CI footnote
+tbl_no_ci$table_styling$abbreviation <-
+  tbl_no_ci$table_styling$abbreviation |>
+  dplyr::filter(column != "conf.low")
+
+tbl_no_ci |>
+  modify_caption("**Table 2. Model B: Demographic + SES Predictors**") |>
+  as_gt()
+```
+
+## Column Name Lookup
+
+Before customizing column headers with `modify_header()`, use
+`show_header_names()` to print the exact internal column names gtsummary
+assigns. This eliminates guesswork.
+
+```{r}
+#| label: show-header-names
+
+tbl_regression(m_A, exponentiate = TRUE) |>
+  show_header_names()
+```
+
+`"estimate"` = OR column, `"conf.low"` / `"conf.high"` = CI bounds,
+`"std.error"` = SE. Pass these strings to `modify_header()`.
+
+:::
+
+# Part 3: Combining Tables
+
+::: {.panel-tabset}
+
+## Side by Side (`tbl_merge`)
+
+`tbl_merge()` places multiple model tables side by side under optional
+spanning headers — the standard multi-model format for journal manuscripts.
+
+```{r}
+#| label: tbl-merge
+
+# Helper: builds a consistently formatted model table
+make_tbl <- function(model) {
+  tbl_regression(
+    model,
+    exponentiate = TRUE,
+    conf.int     = FALSE
+  ) |>
+    add_significance_stars(
+      hide_ci  = TRUE,
+      hide_se  = FALSE,
+      pattern  = "{estimate}{stars}"
+    ) |>
+    remove_row_type(type = "reference") |>
+    bold_labels() |>
+    italicize_levels() |>
+    modify_header(estimate ~ "**OR**", std.error ~ "**SE**")
+}
+
+t_A <- make_tbl(m_A)
+t_B <- make_tbl(m_B)
+t_C <- make_tbl(m_C)
+
+# Remove orphaned CI footnotes
+for (tbl_obj in list(t_A, t_B, t_C)) {
+  tbl_obj$table_styling$abbreviation <-
+    tbl_obj$table_styling$abbreviation |>
+    dplyr::filter(column != "conf.low")
+}
+
+tbl_merge(
+  tbls      = list(t_A, t_B, t_C),
+  tab_spanner = c(
+    "**Model A: Demographic**",
+    "**Model B: + SES**",
+    "**Model C: Full**"
+  )
+) |>
+  bold_labels() |>
+  modify_caption("**Table 3. Logistic Regression: Predictors of Poor Self-Rated Health**") |>
+  as_gt() |>
+  tab_footnote(
+    footnote = "OR = odds ratio; SE = standard error. Survey-weighted quasibinomial logistic regression. ***p < 0.001; **p < 0.01; *p < 0.05.",
+    locations = cells_title()
+  )
+```
+
+::: {.callout-tip}
+Spanning headers in `tab_spanner` support markdown (`**bold**`). All
+subsequent calls such as `bold_labels()` apply to the merged object.
+:::
+
+## Stacked (`tbl_stack`)
+
+`tbl_stack()` stacks tables vertically under group headers — ideal for
+comparing an unweighted model to a survey-weighted model. The difference in
+confidence interval widths illustrates the design effect directly.
+
+```{r}
+#| label: tbl-stack
+
+# Unweighted model (plain glm)
+m_unwt <- glm(
+  poor_health ~ us_born + genx_mil + male + race_eth15 + edu4 + famincome,
+  data   = nhis_cc,
+  family = binomial()
+)
+
+tbl_unwt <- tbl_regression(m_unwt, exponentiate = TRUE) |>
+  remove_row_type(type = "reference") |>
+  bold_labels() |>
+  italicize_levels()
+
+# Survey-weighted model (already fitted as m_B)
+tbl_wt <- tbl_regression(m_B, exponentiate = TRUE) |>
+  remove_row_type(type = "reference") |>
+  bold_labels() |>
+  italicize_levels()
+
+tbl_stack(
+  tbls         = list(tbl_unwt, tbl_wt),
+  group_header = c(
+    "Unweighted (plain glm)",
+    "Survey-Weighted (svyglm + quasibinomial)"
+  )
+) |>
+  modify_caption("**Table 4. Unweighted vs. Survey-Weighted Logistic Regression**") |>
+  as_gt() |>
+  tab_footnote(
+    footnote = "Models include: nativity, birth cohort, sex, race/ethnicity, education, and family income. OR = odds ratio; 95% CI in brackets.",
+    locations = cells_title()
+  )
+```
+
+::: {.callout-note}
+Notice how confidence intervals widen in the survey-weighted model. This
+reflects the design effect: clustering and stratification reduce the
+effective sample size, increasing standard errors.
+:::
+
+:::
+
+# Part 4: Exporting to Word with flextable
+
+For manuscript submission, most journals require `.docx` files.
+`as_flex_table()` converts any gtsummary object to a flextable, which is
+then exported with `save_as_docx()`.
+
+::: {.panel-tabset}
+
+## Convert from gtsummary
+
+```{r}
+#| label: flextable-export
+
+ft <- tbl_merge(
+  tbls      = list(t_A, t_B, t_C),
+  tab_spanner = c(
+    "**Model A: Demographic**",
+    "**Model B: + SES**",
+    "**Model C: Full**"
+  )
+) |>
+  bold_labels() |>
+  modify_caption("Table 3. Logistic Regression: Predictors of Poor Self-Rated Health") |>
+  as_flex_table() |>
+  set_table_properties(width = 1, layout = "autofit") |>
+  fontsize(size = 10, part = "all") |>
+  font(fontname = "Times New Roman", part = "all") |>
+  add_footer_lines(
+    "Note. OR = odds ratio; SE = standard error. Survey-weighted quasibinomial logistic regression. ***p < 0.001; **p < 0.01; *p < 0.05."
+  )
+
+ft
+```
+
+```{r}
+#| label: save-docx
+#| eval: false
+
+# Always save in its own separate chunk
+save_as_docx(ft, path = "output/Table3_regression.docx")
+```
+
+::: {.callout-important}
+## `save_as_docx()` rule
+
+Always call `save_as_docx()` in its **own separate chunk**. Sharing a chunk
+with table-building code causes Quarto to render the table inline and write
+the file simultaneously, producing duplicate output.
+:::
+
+## Standalone flextable
+
+You can also build a flextable directly from any data frame — without going
+through gtsummary — when you need full control over layout.
+
+```{r}
+#| label: flextable-standalone
+
+summary_tbl <- nhis_cc |>
+  group_by(us_born) |>
+  summarise(
+    N        = n(),
+    Pct_poor = round(mean(poor_health) * 100, 1),
+    .groups  = "drop"
+  )
+
+flextable(summary_tbl) |>
+  set_header_labels(
+    us_born  = "Nativity",
+    N        = "N (unweighted)",
+    Pct_poor = "% Poor Health"
+  ) |>
+  bold(part = "header") |>
+  bg(bg = "#f0f0f0", part = "header") |>
+  add_footer_lines("Source: NHIS teaching sample, n = 16,880 complete cases.") |>
+  autofit() |>
+  set_caption("Summary of Poor Health by Nativity")
+```
+
+:::
+
+# Quick Reference
+
+::: {.panel-tabset}
+
+## gtsummary functions
+
+```{r}
+#| label: cheatsheet
+#| echo: false
+
+tibble::tribble(
+  ~Function,                          ~Purpose,
+  "`tbl_summary()`",                  "Unweighted descriptive statistics",
+  "`tbl_svysummary()`",               "Survey-weighted descriptive statistics",
+  "`tbl_regression()`",               "Regression table from model object",
+  "`tbl_merge()`",                    "Place tables side by side",
+  "`tbl_stack()`",                    "Stack tables vertically",
+  "`add_overall()`",                  "Add total/overall column",
+  "`add_p()`",                        "Append p-values for group comparisons",
+  "`type = list(var ~ 'continuous')`","Display variable as mean (SD)",
+  "`type = list(var ~ 'categorical')`","Display variable as counts (%)",
+  "`statistic = list(...)`",          "Customize the displayed statistic",
+  "`bold_labels()`",                  "Bold variable name rows",
+  "`italicize_levels()`",             "Italicize category rows",
+  "`bold_p(t = 0.05)`",               "Bold significant p-values",
+  "`remove_row_type('reference')`",   "Drop reference category rows",
+  "`add_significance_stars()`",       "Add * ** *** to estimates",
+  "`modify_header()`",                "Rewrite column headers (use `{n}` for counts)",
+  "`modify_caption()`",               "Add or change table caption",
+  "`show_header_names()`",            "Print internal column name reference",
+  "`as_gt()`",                        "Convert to gt for HTML rendering",
+  "`as_flex_table()`",                "Convert to flextable (for Word export)",
+  "`options(gtsummary.use_ftExtra = TRUE)`", "Preserve markdown formatting in Word export",
+  "`set_gtsummary_theme(...)`",       "Apply a theme globally for the session"
+) |>
+  gt() |>
+  fmt_markdown(columns = Function) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(table.font.size = px(12))
+```
+
+## Package decision guide
+
+```{r}
+#| label: pkg-comparison
+#| echo: false
+
+tibble::tribble(
+  ~Task,                               ~Package,    ~Function,
+  "Descriptive Table 1",               "gtsummary", "`tbl_summary()` / `tbl_svysummary()`",
+  "Single regression table",           "gtsummary", "`tbl_regression()`",
+  "Multiple models side by side",      "gtsummary", "`tbl_merge()`",
+  "Before/after comparison (stacked)", "gtsummary", "`tbl_stack()`",
+  "Word / .docx export",               "flextable", "`as_flex_table()` + `save_as_docx()`",
+  "Custom standalone table",           "flextable", "`flextable()`"
+) |>
+  gt() |>
+  fmt_markdown(columns = Function) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) |>
+  tab_options(table.font.size = px(12))
+```
+
+:::
+
+---

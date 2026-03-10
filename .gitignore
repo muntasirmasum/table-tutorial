@@ -1,0 +1,13 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Quarto generated output (managed by gh-pages branch)
+table_tutorial.html
+*_cache/
+*_files/
+
+# Word exports (generated on demand)
+output/*.docx
