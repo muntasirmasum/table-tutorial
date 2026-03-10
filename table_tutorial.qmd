@@ -7,6 +7,7 @@ date-format: "MMMM D, YYYY"
 
 format:
   html:
+    output-file: index.html
     theme: flatly
     toc: true
     toc-depth: 3
